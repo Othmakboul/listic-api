@@ -1,10 +1,11 @@
 import httpx
 import urllib.parse
 from collections import Counter
+from typing import Optional
 
 HAL_API_URL = "https://api.archives-ouvertes.fr/search/"
 
-async def get_hal_stats(name: str):
+async def get_hal_stats(name: str, start_year: Optional[int] = None, end_year: Optional[int] = None, keyword: Optional[str] = None):
     """
     Fetches statistics for a researcher from HAL API.
     """
@@ -15,7 +16,7 @@ async def get_hal_stats(name: str):
     query = f'authFullName_t:"{clean_name}"'
     
     # Fields we want to retrieve to build stats
-    fl = "title_s,producedDateY_i,docType_s,keyword_s,authFullName_s,journalTitle_s"
+    fl = "title_s,producedDateY_i,docType_s,keyword_s,authFullName_s,journalTitle_s,conferenceTitle_s"
     
     params = {
         "q": query,
@@ -24,7 +25,24 @@ async def get_hal_stats(name: str):
         "rows": 500, # Max rows to analyze
         "sort": "producedDateY_i desc"
     }
+
+    # Filters
+    filters = []
+    if start_year or end_year:
+        s = start_year if start_year else "*"
+        e = end_year if end_year else "*"
+        filters.append(f"producedDateY_i:[{s} TO {e}]")
     
+    if keyword:
+        # Quote the keyword to handle spaces, and escape existing quotes if any
+        safe_keyword = keyword.replace('"', '\\"')
+        filters.append(f'keyword_s:"{safe_keyword}"')
+        
+        # Combine filters into a single string with AND
+        params["fq"] = " AND ".join(filters)
+    
+    print(f"DEBUG HAL REQUEST: {HAL_API_URL} with params {params}")
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(HAL_API_URL, params=params, timeout=10.0)
@@ -32,8 +50,30 @@ async def get_hal_stats(name: str):
             data = response.json()
             docs = data.get("response", {}).get("docs", [])
             
+            # --- Manual Fallback Filtering ---
+            # Ensure strict compliance with filters even if API is loose
+            filtered_docs = []
+            for d in docs:
+                # Year Filter
+                y = d.get("producedDateY_i")
+                if start_year and y and y < start_year: continue
+                if end_year and y and y > end_year: continue
+                
+                # Keyword Filter (Case insensitive partial match for robustness)
+                if keyword:
+                    kws = d.get("keyword_s", [])
+                    if isinstance(kws, str): kws = [kws]
+                    # Check if any keyword contains the search term
+                    if not any(keyword.lower() in k.lower() for k in kws):
+                        continue
+                
+                filtered_docs.append(d)
+                
+            docs = filtered_docs
+            # ---------------------------------
+
             if not docs:
-                return {"found": False, "source": "HAL", "count": 0}
+                return {"found": True, "source": "HAL", "count": 0, "total_publications": 0, "years_distribution": {}, "types_distribution": {}, "top_keywords": {}, "top_collaborators": {}, "top_journals": {}, "recent_publications": []}
 
             # Process Stats
             years = []
@@ -148,4 +188,83 @@ async def get_project_stats(project_name: str):
 
         except Exception as e:
             print(f"Error fetching HAL project data for {project_name}: {e}")
+            return {"error": str(e)}
+async def get_listic_stats(start_year: Optional[int] = None, end_year: Optional[int] = None):
+    """
+    Fetches global statistics for the LISTIC lab using Facets.
+    Supports optional year filtering.
+    """
+    query = 'structAcronym_s:"LISTIC"'
+    
+    # We use rows=0 because we only care about facets (counts), not the documents themselves.
+    params = {
+        "q": query,
+        "wt": "json",
+        "rows": 0,
+        "facet": "true",
+        "facet.field": [
+            "producedDateY_i",
+            "keyword_s",
+            "docType_s",
+            "authFullName_s",
+            "journalTitle_s",
+            "language_s",
+            "structName_s"
+        ],
+        "facet.limit": 50, # Get top 50
+        "facet.mincount": 1
+    }
+    
+    # Add Filter Query for date range if provided
+    if start_year or end_year:
+        # Default boundary if one side missing
+        s = start_year if start_year else "*"
+        e = end_year if end_year else "*"
+        params["fq"] = f"producedDateY_i:[{s} TO {e}]"
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(HAL_API_URL, params=params, timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+            
+            facet_counts = data.get("facet_counts", {}).get("facet_fields", {})
+            
+            # Helper to convert ["2023", 10, "2022", 5] list to [{"name": "2023", "value": 10}, ...]
+            def parse_facet(flat_list):
+                res = []
+                for i in range(0, len(flat_list), 2):
+                    res.append({
+                        "name": str(flat_list[i]),
+                        "value": flat_list[i+1]
+                    })
+                return res
+
+            years_data = parse_facet(facet_counts.get("producedDateY_i", []))
+            keywords_data = parse_facet(facet_counts.get("keyword_s", []))
+            types_data = parse_facet(facet_counts.get("docType_s", []))
+            authors_data = parse_facet(facet_counts.get("authFullName_s", []))
+            journals_data = parse_facet(facet_counts.get("journalTitle_s", []))
+            languages_data = parse_facet(facet_counts.get("language_s", []))
+            structures_data = parse_facet(facet_counts.get("structName_s", []))
+            
+            # Post-process structures to exclude "LISTIC" itself from collaborators list
+            structures_data = [s for s in structures_data if "LISTIC" not in s["name"].upper() and "LABORATOIRE D'INFORMATIQUE" not in s["name"].upper()]
+
+            # Sort years numerically
+            years_data.sort(key=lambda x: int(x["name"]) if x["name"].isdigit() else 0)
+            
+            return {
+                "years": years_data,
+                "keywords": keywords_data,
+                "types": types_data,
+                "authors": authors_data,
+                "journals": journals_data,
+                "languages": languages_data,
+                "structures": structures_data,
+                "total_docs": data.get("response", {}).get("numFound", 0)
+            }
+            
+        except Exception as e:
+            print(f"Error fetching LISTIC global stats: {e}")
             return {"error": str(e)}

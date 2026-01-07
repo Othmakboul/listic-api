@@ -4,3 +4,4 @@ httpx
 pydantic
 pandas
 python-multipart
+motor

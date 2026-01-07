@@ -1,0 +1,31 @@
+services:
+  mongodb:
+    build: ../listic-database
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URL=mongodb://mongodb:27017
+      - DATA_PATH_RESEARCHERS=/app/data/listic personnes/listic_personnes.complete_structure.json
+      - DATA_PATH_PROJECTS=/app/data/listic_projet/listic_projets.complete_structure.json
+    volumes:
+      # Mount the database directory so the backend can seed the data
+      - ../listic-database:/app/data
+    depends_on:
+      - mongodb
+
+  frontend:
+    build: ../frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  mongo_data:
